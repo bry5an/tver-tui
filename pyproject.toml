@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tver-tui"
+version = "0.1.0"
+description = "Terminal UI for exploring TVer.jp series"
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=0.60",
+    "requests>=2.31",
+    "certifi>=2024.0",
+]
+
+[project.scripts]
+tver-tui = "tver_tui.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tver_tui"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
