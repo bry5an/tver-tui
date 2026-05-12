@@ -16,8 +16,12 @@ from textual.widgets import (
     ListItem,
     ListView,
     Static,
+    Tree,
 )
+
 from .api import Season, SeriesInfo, TVerAPIError, TVerClient, parse_series_id
+from .config import ConfigSeries, load_config
+from .db import SubtitleCounts, get_subtitle_counts
 from .vpn import check_ip
 
 _CSS = """
@@ -49,8 +53,26 @@ Screen {
     height: 1fr;
 }
 
+#config-pane {
+    width: 40;
+    border-right: solid $border;
+    layout: vertical;
+}
+
+#config-header {
+    height: 1;
+    padding: 0 1;
+    background: $boost;
+    color: $text-muted;
+    text-style: bold;
+}
+
+#config-tree {
+    height: 1fr;
+}
+
 #seasons-pane {
-    width: 30;
+    width: 26;
     border-right: solid $border;
     layout: vertical;
 }
@@ -97,12 +119,14 @@ class TVerTUI(App[None]):
         Binding("o", "open_episode", "Open in browser"),
         Binding("r", "refresh_series", "Refresh"),
         Binding("/", "focus_input", "Search"),
+        Binding("c", "focus_config", "Config"),
         Binding("s", "focus_seasons", "Seasons"),
         Binding("e", "focus_episodes", "Episodes"),
         Binding("ctrl+l", "focus_input", show=False),
     ]
 
     _series: SeriesInfo | None = None
+    _config_nodes: dict[str, tuple]  # url -> (TreeNode, ConfigSeries)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -115,6 +139,9 @@ class TVerTUI(App[None]):
                 yield Button("Fetch", variant="primary", id="fetch-btn")
             yield Static("Enter a series URL or ID above to get started.", id="series-info")
             with Horizontal(id="browser"):
+                with Vertical(id="config-pane"):
+                    yield Static("Config", id="config-header")
+                    yield Tree("root", id="config-tree")
                 with Vertical(id="seasons-pane"):
                     yield Static("Seasons", id="seasons-header")
                     yield ListView(id="seasons-list")
@@ -124,6 +151,7 @@ class TVerTUI(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
+        self._config_nodes = {}
         table = self.query_one("#episodes-table", DataTable)
         table.cursor_type = "row"
         table.add_column("Title")
@@ -131,7 +159,71 @@ class TVerTUI(App[None]):
         table.add_column("CC", width=3)
         table.add_column("Dur", width=5)
         table.add_column("Exp", width=7)
+        self._load_config_tree()
         self._check_ip()
+
+    def _load_config_tree(self) -> None:
+        tree = self.query_one("#config-tree", Tree)
+        tree.show_root = False
+        tree.show_guides = True
+        groups = load_config()
+        for group in groups:
+            group_node = tree.root.add(group.name.replace("_", " "), expand=True)
+            for series in group.series:
+                label = self._series_label(series)
+                node = group_node.add_leaf(label, data=series)
+                self._config_nodes[series.url] = (node, series)
+        if not groups:
+            tree.root.add_leaf("(no config found)", data=None)
+        self._fetch_subtitle_status()
+
+    @staticmethod
+    def _series_label(series: ConfigSeries, counts: SubtitleCounts | None = None) -> Text:
+        label = Text(series.name)
+        if not series.subtitles:
+            label.append(" ·cc", style="dim")
+            return label
+        if counts is not None:
+            problem = counts.missing + counts.untracked
+            if problem:
+                label.append(f" ✗{problem}", style="red bold")
+            if counts.available:
+                label.append(f" ↓{counts.available}", style="yellow bold")
+            if counts.not_available:
+                label.append(f" ?{counts.not_available}", style="dim")
+        return label
+
+    def _fetch_subtitle_status(self) -> None:
+        urls = list(self._config_nodes.keys())
+        if not urls:
+            return
+
+        def _run() -> None:
+            ids: list[str] = []
+            id_to_url: dict[str, str] = {}
+            for url in urls:
+                try:
+                    sid = parse_series_id(url)
+                    ids.append(sid)
+                    id_to_url[sid] = url
+                except Exception:
+                    pass
+            counts = get_subtitle_counts(ids)
+            self.call_from_thread(self._apply_subtitle_status, counts, id_to_url)
+
+        self.run_worker(_run, thread=True)
+
+    def _apply_subtitle_status(
+        self, counts: dict[str, SubtitleCounts], id_to_url: dict[str, str]
+    ) -> None:
+        tree = self.query_one("#config-tree", Tree)
+        for sid, url in id_to_url.items():
+            entry = self._config_nodes.get(url)
+            if entry is None:
+                continue
+            node, series = entry
+            node.label = self._series_label(series, counts.get(sid))
+        tree.refresh()
 
     # ── IP check ────────────────────────────────────────────────────────────
 
@@ -259,6 +351,17 @@ class TVerTUI(App[None]):
             ep = season.episodes[row]
             webbrowser.open(ep.url)
             self.notify(f"Opened: {ep.title}", title="Browser")
+
+    def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
+        series: ConfigSeries | None = event.node.data
+        if series is None:
+            return
+        inp = self.query_one("#url-input", Input)
+        inp.value = series.url
+        self._do_fetch()
+
+    def action_focus_config(self) -> None:
+        self.query_one("#config-tree", Tree).focus()
 
     def action_focus_input(self) -> None:
         self.query_one("#url-input", Input).focus()
